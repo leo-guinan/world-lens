@@ -59,7 +59,7 @@ The CLIs are:
 
 ```sh
 node bin/lens-seal.mjs unsealed.json -o pack.json          # hash and seal a pack written by any capture script
-node bin/lens-verify.mjs pack.json --dir <screens> --quotes quotes.json [--allow-missing-screens]
+node bin/lens-verify.mjs pack.json --dir <folder> [--dir <folder>…] --quotes quotes.json [--allow-missing-screens]
 ```
 
 `lens-verify` exits 0 only if the pack verifies and every quote is supported. The Future Radio studio vendors these files, and its scenes refuse anything `supports()` refuses.
