@@ -1,0 +1,1 @@
+{"manifest_version":3,"name":"World Lens — Selected Tab","version":"0.1.0","description":"Review and export one explicitly selected page capture. Local only.","permissions":["activeTab","scripting"],"action":{"default_popup":"popup.html"}}

@@ -1,0 +1,21 @@
+services:
+  world-lens:
+    build: .
+    ports:
+      - "127.0.0.1:${PORT:-8792}:8792"
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8792
+      DATA_DIR: /data
+    volumes:
+      - world-lens-data:/data
+    init: true
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 128
+    mem_limit: 1g
+volumes:
+  world-lens-data:
