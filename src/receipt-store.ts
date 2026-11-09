@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ObservationReceipt } from "./world-lens.ts";
 import type { ObservationChange } from "./live-observation.ts";
@@ -7,7 +7,9 @@ import type { ObservationChange } from "./live-observation.ts";
 const DATA = process.env.DATA_DIR || join(process.cwd(), "data");
 const RECEIPTS = join(DATA, "receipts");
 const SHOTS = join(DATA, "screenshots");
-const OBSERVATIONS = join(DATA, "observations");
+export const OBSERVATIONS = join(DATA, "observations");
+export const FEED_FILE = join(DATA, "live-feed.ndjson");
+const OBSERVERS = join(DATA, "live-observers.json");
 const observationFile = (id: string) => join(OBSERVATIONS, `${id}.json`);
 const receiptFile = (id: string) => join(RECEIPTS, `${id}.json`);
 const validId = (id: string) => /^[0-9a-f-]{36}$/i.test(id);
@@ -40,4 +42,21 @@ export async function readReceipt(id: string): Promise<ObservationReceipt | null
 export async function readScreenshot(id: string): Promise<Buffer | null> {
   if (!validId(id)) return null;
   try { return await readFile(join(SHOTS, `${id}.png`)); } catch { return null; }
+}
+/** Remove a receipt and its screenshot (a live poll that showed nothing new). */
+export async function discardReceipt(id: string) {
+  if (!validId(id)) return;
+  await Promise.all([rm(receiptFile(id), { force: true }), rm(join(SHOTS, `${id}.png`), { force: true })]);
+}
+export interface SavedObserver { url: string; intervalSeconds: number }
+/** Which pages are being watched, so a restart can pick them up again. Written whole, then moved into place. */
+export async function saveObservers(list: SavedObserver[]) {
+  await mkdir(DATA, { recursive: true, mode: 0o700 });
+  await writeFile(OBSERVERS + ".tmp", JSON.stringify(list, null, 2), { mode: 0o600 }); await rename(OBSERVERS + ".tmp", OBSERVERS);
+}
+export async function readObservers(): Promise<SavedObserver[]> {
+  try {
+    const list = JSON.parse(await readFile(OBSERVERS, "utf8"));
+    return Array.isArray(list) ? list.filter(x => typeof x?.url === "string" && Number.isInteger(x?.intervalSeconds)) : [];
+  } catch { return []; }
 }

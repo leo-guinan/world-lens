@@ -19,7 +19,11 @@ export class LiveObserver {
   constructor(
     private readonly observe: (url: string) => Promise<ObservationReceiptLike>,
     private readonly onReceipt: (r: ObservationReceiptLike) => Promise<void>,
-    private readonly onChange: (e: ObservationChange) => Promise<void>,
+    private readonly onChange: (e: ObservationChange, receipt: ObservationReceiptLike) => Promise<void>,
+    /** When given, a poll that shows nothing new is handed here to be thrown away, and the receipt it matched
+     * stays the one later changes are compared with. Without this, an observer left running stores a receipt
+     * and a screenshot for every poll, changed or not, for as long as it runs. */
+    private readonly onUnchanged?: (duplicate: ObservationReceiptLike) => Promise<void>,
   ) {}
 
   getState(): LiveObserverState { return { ...this.state }; }
@@ -46,9 +50,14 @@ export class LiveObserver {
       const receipt = await this.observe(this.state.url);
       await this.onReceipt(receipt);
       const event = diffObservation(this.previous, receipt);
+      if (event.kind === "unchanged" && this.onUnchanged) {
+        this.state = { ...this.state, polls: this.state.polls + 1, lastError: null };
+        await this.onUnchanged(receipt);
+        return;
+      }
       this.previous = receipt;
       this.state = { ...this.state, lastReceiptId: receipt.id, polls: this.state.polls + 1, changes: this.state.changes + (event.changed ? 1 : 0), lastError: null };
-      if (event.changed) await this.onChange(event);
+      if (event.changed) await this.onChange(event, receipt);
     } catch (error) {
       this.state = { ...this.state, lastError: error instanceof Error ? error.message : "observation failed" };
     } finally {

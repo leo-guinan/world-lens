@@ -22,6 +22,18 @@ The server binds loopback by default. Do not put it on the public internet witho
 
 The adapter extracts visible body text, headings, links, and form/control labels (bounded sizes), with locators for source elements. The receipt records requested/final URLs, status, browser engine, actions, `mutations: []`, a stable receipt ID, SHA-256 snapshot hash, and screenshot hash. Text, headings, and link/control records are evidence. Interpretation, trust, or whether a control is safe to activate are intentionally not asserted.
 
+## Live feed
+
+A live observer polls one page (`POST /api/lens/live/start` with `{ "url", "intervalSeconds" }`, 30 to 3600 seconds) and reports only when the visible evidence changes. Every change gets the next sequence number, is appended to `data/live-feed.ndjson`, and is sent to whoever is listening.
+
+- `GET /api/lens/live/stream` is a server-sent event stream: one message per change, `id` set to its sequence number. A new client hears only what happens next. A client that reconnects sends the last number it saw (`Last-Event-ID`, or `?after=<seq>`) and gets what it missed; if some of that is no longer held in memory it is told so with a `gap` event first.
+- `GET /api/lens/live/events` returns recent changes in the order they happened, and with `?after=<seq>` only the later ones.
+- Each message carries a signal (`world-lens.signal.v1`): at most 12 added and 6 removed items of 240 characters each, headlines first, with the receipt id, snapshot hash and screenshot URL of the observation behind it. It is the same untrusted evidence as the full change event, cut to size. Nothing is interpreted, ranked or summarised by a model, and `interpretation` stays `null`.
+
+The feed is built to be left running. The list of watched pages is saved and picked up again on start, each with a new baseline, so a restart never reports old content as a change. A poll that shows nothing new no longer leaves a receipt and a screenshot behind: only the observations that a change points to are kept. The journal starts a new file when it passes 64 MB. Change files written one per event by earlier versions are imported into the journal the first time it is created.
+
+[fold](https://github.com/leo-guinan/fold)'s control room follows this stream directly (`node tools/room.mjs <show> --signals http://127.0.0.1:8792/api/lens/live/stream`) and turns each signal into an event in a live animation. What a signal means on screen is decided by that show's rules, which copy out bounded fields and never act on page text.
+
 ## Security boundary
 
 - HTTPS only; query strings, embedded credentials, literal IPs, local names, and private/reserved DNS answers are rejected.
@@ -60,7 +72,7 @@ Verification: `RETAINED_ARTIFACT_DIR=<absolute-output-directory> node --import t
 
 This repository contains the World Lens service, browser adapter, retained-session lifecycle, selected-tab extension, UI and reproducible tests/harnesses. Runtime captures, screenshots, disposable browser profiles, credentials and local logs are excluded. Future Radio integration code lives in a separate checkout and is not part of this push; references to its producer routes describe that companion integration, not bundled functionality.
 
-Current local checks: 23 tests pass; typecheck and JavaScript syntax checks pass. Controlled product-dispatcher and retained-session browser rehearsals have also passed. These results do not establish internet-facing security, personal-browser attachment, audio output or public broadcast. No deployment is included.
+Current local checks: 29 tests; typecheck passes. The live feed, signal and stream tests need no browser. Controlled product-dispatcher and retained-session browser rehearsals have also passed. These results do not establish internet-facing security, personal-browser attachment, audio output or public broadcast. No deployment is included.
 
 ## Deployment boundary
 

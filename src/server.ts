@@ -1,9 +1,10 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { extname, join, normalize } from "node:path";
 import { existsSync, readFileSync } from "node:fs";
-import { diffObservation, type ObservationReceiptLike, type ObservationChange } from "./live-observation.ts";
-import { readReceipt, readScreenshot, storeReceipt, storeScreenshot, storeObservationEvent, readObservationEvents } from "./receipt-store.ts";
-import { observeUrl, PlaywrightBrowserPort } from "./world-lens.ts";
+import { type ObservationReceiptLike } from "./live-observation.ts";
+import { readReceipt, readScreenshot, storeReceipt, storeScreenshot, discardReceipt, saveObservers, readObservers, FEED_FILE, OBSERVATIONS } from "./receipt-store.ts";
+import { observeUrl, parseTargetUrl, PlaywrightBrowserPort } from "./world-lens.ts";
+import { LiveFeed, type FeedEntry } from "./live-feed.ts";
 import { RetainedBrowserSession } from "./retained-session.ts";
 import { sessionRoutes } from "./session-routes.ts";
 import { LiveObserver } from "./live-observer.ts";
@@ -15,7 +16,32 @@ const MIME: Record<string, string> = { ".html": "text/html; charset=utf-8", ".cs
 const MAX_BODY = 16_384;
 const MAX_POLL_INTERVAL = 3600;
 const MAX_LIVE_OBSERVERS = 8;
+const MAX_STREAMS = 16;
 const observers = new Map<string, LiveObserver>();
+/** Every change the live observers see, in order. Consumers follow it at /api/lens/live/stream. */
+export const feed = new LiveFeed(FEED_FILE, { legacyDir: OBSERVATIONS });
+const feedReady = feed.load().catch(error => { console.error("Live feed could not be read:", error instanceof Error ? error.message : "unknown"); });
+const streams = new Set<ServerResponse>();
+
+/** Watch a page: poll it, keep the receipts that show a change, and put each change on the feed. */
+async function startObserver(url: string, intervalSeconds: number) {
+  const observer = new LiveObserver(async target => {
+    let image: Buffer | undefined;
+    const raw = await observeUrl(target, async (_id, png) => { image = png; return ""; });
+    if (!image) throw new Error("Screenshot was not captured");
+    const screenshot = await storeScreenshot(raw.id, image);
+    const receipt = { ...raw, screenshotUrl: screenshot.url, screenshotHash: screenshot.sha256 };
+    await storeReceipt(receipt);
+    return receipt as ObservationReceiptLike;
+  }, async () => {}, async (event, receipt) => {
+    await feed.append(event, { title: receipt.title, screenshotUrl: `/api/lens/receipts/${receipt.id}/screenshot` });
+  }, async duplicate => { await discardReceipt(duplicate.id); });
+  observers.set(url, observer);
+  try { return await observer.start(url, intervalSeconds); } catch (error) { observers.delete(url); throw error; }
+}
+const persistObservers = () => saveObservers([...observers.values()].map(o => o.getState()).filter(s => s.url && s.intervalSeconds).map(s => ({ url: s.url!, intervalSeconds: s.intervalSeconds! })))
+  .catch(error => { console.error("Observer list could not be saved:", error instanceof Error ? error.message : "unknown"); });
+const streamEntry = (entry: FeedEntry) => `id: ${entry.seq}\ndata: ${JSON.stringify({ seq: entry.seq, at: entry.at, signal: entry.signal })}\n\n`;
 const NO_STORE = { "cache-control": "no-store", "x-content-type-options": "nosniff" };
 function json(res: ServerResponse, status: number, value: unknown) { res.writeHead(status, { ...NO_STORE, "content-type": "application/json; charset=utf-8" }); res.end(JSON.stringify(value)); }
 async function body(req: IncomingMessage): Promise<any> {
@@ -44,8 +70,8 @@ export const server = createServer(async (req, res) => {
   const url = new URL(req.url || "/", "http://localhost");
   try {
     if(await retainedSessions.handle(req,res,url.pathname))return;
-    if (req.method === "GET" && url.pathname === "/healthz") return json(res, 200, { ok: true, service: "world-lens", version: "0.1.0", mode: "observation-only" });
-    if (req.method === "GET" && url.pathname === "/api/lens/policy") return json(res, 200, { mode: "browser-observation", sourceKind: "browser", mutations: [], allowedSchemes: ["https"], queryParameters: false, allowedMethods: ["GET", "HEAD"], actions: ["navigate", "extract_visible_dom", "screenshot"], liveObserve: { enabled: true, minIntervalSeconds: 30, maxIntervalSeconds: 3600, changeEvent: "world-lens.live-observation.v1", pageContentIsUntrusted: true, actionsAuthorized: false }, maxBodyBytes: MAX_BODY, requiresApprovalToBrowse: true });
+    if (req.method === "GET" && url.pathname === "/healthz") return json(res, 200, { ok: true, service: "world-lens", version: "0.1.0", mode: "observation-only", live: { observers: observers.size, lastSeq: feed.seq, streams: streams.size } });
+    if (req.method === "GET" && url.pathname === "/api/lens/policy") return json(res, 200, { mode: "browser-observation", sourceKind: "browser", mutations: [], allowedSchemes: ["https"], queryParameters: false, allowedMethods: ["GET", "HEAD"], actions: ["navigate", "extract_visible_dom", "screenshot"], liveObserve: { enabled: true, minIntervalSeconds: 30, maxIntervalSeconds: 3600, changeEvent: "world-lens.live-observation.v1", signal: "world-lens.signal.v1", stream: "/api/lens/live/stream", pageContentIsUntrusted: true, actionsAuthorized: false }, maxBodyBytes: MAX_BODY, requiresApprovalToBrowse: true });
     if (req.method === "POST" && url.pathname === "/api/lens/live/start") {
       let input: any;
       try { input = await body(req); } catch { return json(res, 400, { error: "Invalid JSON or request body too large" }); }
@@ -53,20 +79,11 @@ export const server = createServer(async (req, res) => {
       if (typeof input?.url !== "string") return json(res, 400, { error: "url is required" });
       if (!Number.isInteger(interval) || interval < 30 || interval > MAX_POLL_INTERVAL) return json(res, 400, { error: "intervalSeconds must be an integer from 30 to 3600" });
       try {
-        const url = (await import("./world-lens.ts")).parseTargetUrl(input.url).toString();
+        const url = parseTargetUrl(input.url).toString();
         if (observers.has(url)) return json(res, 409, { error: "This URL already has a live observer" });
         if (observers.size >= MAX_LIVE_OBSERVERS) return json(res, 429, { error: "Live observer capacity reached" });
-        const observer = new LiveObserver(async target => {
-          let image: Buffer | undefined;
-          const raw = await observeUrl(target, async (_id, png) => { image = png; return ""; });
-          if (!image) throw new Error("Screenshot was not captured");
-          const screenshot = await storeScreenshot(raw.id, image);
-          const receipt = { ...raw, screenshotUrl: screenshot.url, screenshotHash: screenshot.sha256 };
-          await storeReceipt(receipt);
-          return receipt as ObservationReceiptLike;
-        }, async () => {}, async event => { await storeObservationEvent(event); });
-        observers.set(url, observer);
-        const state = await observer.start(url, interval);
+        const state = await startObserver(url, interval);
+        await persistObservers();
         return json(res, 201, state);
       } catch (error) { return json(res, 422, { error: error instanceof Error ? error.message : "Live observation failed" }); }
     }
@@ -75,10 +92,10 @@ export const server = createServer(async (req, res) => {
       try { input = await body(req); } catch { return json(res, 400, { error: "Invalid JSON or request body too large" }); }
       if (typeof input?.url !== "string") return json(res, 400, { error: "url is required" });
       try {
-        const url = (await import("./world-lens.ts")).parseTargetUrl(input.url).toString();
+        const url = parseTargetUrl(input.url).toString();
         const observer = observers.get(url);
         if (!observer) return json(res, 404, { error: "No active observer for URL" });
-        observer.stop(); observers.delete(url);
+        observer.stop(); observers.delete(url); await persistObservers();
         return json(res, 200, { stopped: true, url });
       } catch (error) { return json(res, 400, { error: error instanceof Error ? error.message : "Invalid URL" }); }
     }
@@ -86,7 +103,31 @@ export const server = createServer(async (req, res) => {
     if (req.method === "GET" && url.pathname === "/api/lens/live/events") {
       const requestedLimit = Number(url.searchParams.get("limit") ?? 30);
       const limit = Number.isInteger(requestedLimit) && requestedLimit > 0 ? Math.min(requestedLimit, 100) : 30;
-      return json(res, 200, { events: await readObservationEvents(limit) });
+      await feedReady;
+      // in the order they happened; with ?after=<seq>, only what came after that
+      const after = Number(url.searchParams.get("after"));
+      const entries = url.searchParams.has("after") && Number.isInteger(after) && after >= 0 ? feed.since(after, limit).entries : feed.latest(limit);
+      return json(res, 200, { events: entries.map(entry => entry.event), signals: entries.map(entry => entry.signal), lastSeq: feed.seq });
+    }
+    if (req.method === "GET" && url.pathname === "/api/lens/live/stream") {
+      // Server-sent events: one message per change, numbered. A client that reconnects sends the last number
+      // it saw (Last-Event-ID, or ?after=) and gets what it missed; a new client gets only what happens next.
+      if (streams.size >= MAX_STREAMS) return json(res, 429, { error: "Live stream capacity reached" });
+      await feedReady;
+      const cursor = req.headers["last-event-id"] ?? url.searchParams.get("after");
+      const after = cursor === null || cursor === undefined || cursor === "" ? NaN : Number(cursor);
+      res.writeHead(200, { ...NO_STORE, "content-type": "text/event-stream; charset=utf-8", connection: "keep-alive", "x-accel-buffering": "no" });
+      res.write(`: world-lens live stream, last seq ${feed.seq}\n\n`);
+      if (Number.isInteger(after) && after >= 0) {
+        const { entries, missed } = feed.since(after, 500);
+        if (missed) res.write(`event: gap\ndata: ${JSON.stringify({ after, resumedAt: entries[0]?.seq ?? feed.seq })}\n\n`);
+        for (const entry of entries) res.write(streamEntry(entry));
+      }
+      const unsubscribe = feed.subscribe(entry => { res.write(streamEntry(entry)); });
+      const beat = setInterval(() => { res.write(": keep-alive\n\n"); }, 15_000);
+      streams.add(res);
+      req.on("close", () => { unsubscribe(); clearInterval(beat); streams.delete(res); });
+      return;
     }
     if (req.method === "POST" && url.pathname === "/api/lens/observe") {
       let input: any;
@@ -123,6 +164,9 @@ export function shutdown(options: {deadlineMs?:number} = {}): Promise<void> {
   shutdownPromise=(async()=>{
     for(const observer of observers.values())observer.stop();
     observers.clear();
+    for(const stream of streams)stream.end();
+    streams.clear();
+    await feed.idle();
     const stopped=server.listening?new Promise<void>((resolve,reject)=>server.close(error=>error?reject(error):resolve())):Promise.resolve();
     const cleanup=retainedSessions.closeAll();
     const drained=(async()=>{
@@ -139,6 +183,16 @@ export function shutdown(options: {deadlineMs?:number} = {}): Promise<void> {
 }
 if (process.env.SERVER_AUTOLISTEN !== "0") {
   server.listen(PORT, HOST, () => console.log(`World Lens listening on http://${HOST}:${PORT}`));
+  // Pick up the pages that were being watched before the restart. Each starts with a new baseline, so a
+  // restart never announces old news as a change.
+  void (async () => {
+    await feedReady;
+    for (const saved of await readObservers()) {
+      if (observers.has(saved.url) || observers.size >= MAX_LIVE_OBSERVERS) continue;
+      try { await startObserver(parseTargetUrl(saved.url).toString(), Math.max(30, Math.min(MAX_POLL_INTERVAL, saved.intervalSeconds))); console.log(`Resumed live observer for ${saved.url}`); }
+      catch (error) { console.error(`Could not resume live observer for ${saved.url}:`, error instanceof Error ? error.message : "unknown"); }
+    }
+  })();
   const stop=()=>{void shutdown().catch(error=>{console.error(error);process.exitCode=1})};
   process.once("SIGTERM",stop);process.once("SIGINT",stop);
 }
