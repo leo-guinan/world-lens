@@ -7,6 +7,7 @@ import { observeUrl, PlaywrightBrowserPort } from "./world-lens.ts";
 import { RetainedBrowserSession } from "./retained-session.ts";
 import { sessionRoutes } from "./session-routes.ts";
 import { LiveObserver } from "./live-observer.ts";
+import { packFromReceipt } from "../lib/evidence.js";
 
 const PORT = Number(process.env.PORT || 8792);
 const HOST = process.env.HOST || "127.0.0.1";
@@ -106,6 +107,13 @@ export const server = createServer(async (req, res) => {
     if (req.method === "GET" && receiptMatch) {
       const receipt = await readReceipt(receiptMatch[1]);
       return receipt ? json(res, 200, receipt) : json(res, 404, { error: "Receipt not found" });
+    }
+    // the same capture as an evidence pack (lib/evidence.js): items with captured positions, the screenshot by hash
+    const packMatch = url.pathname.match(/^\/api\/lens\/receipts\/([0-9a-f-]{36})\/pack$/i);
+    if (req.method === "GET" && packMatch) {
+      const receipt = await readReceipt(packMatch[1]) as (Awaited<ReturnType<typeof readReceipt>> & { screenshotHash?: string }) | null;
+      if (!receipt?.screenshotHash) return json(res, 404, { error: "Receipt not found" });
+      return json(res, 200, await packFromReceipt(receipt, { screenshotFile: `${receipt.id}.png`, screenshotSha256: receipt.screenshotHash }));
     }
     const imageMatch = url.pathname.match(/^\/api\/lens\/receipts\/([0-9a-f-]{36})\/screenshot$/i);
     if (req.method === "GET" && imageMatch) {

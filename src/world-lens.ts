@@ -2,24 +2,28 @@ import { createHash, randomUUID } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
 import { chromium, type Browser as PlaywrightBrowser } from "playwright";
+import { extractVisibleBlocks, type TextBlock, type Viewport, type Box } from "../lib/extract-blocks.js";
+export type { TextBlock, Viewport, Box };
 
 export interface LinkEvidence { text: string; href: string; locator: string }
 export interface ControlEvidence { role: string; label: string; type: string; locator: string; disabled: boolean }
-export interface Observation { evidenceId: string; kind: "title" | "heading" | "text" | "link" | "control"; value: string; locator: string }
+export interface Observation { evidenceId: string; kind: "title" | "heading" | "text" | "link" | "control" | "block"; value: string; locator: string; box?: Box | null; inView?: boolean; drawn?: boolean }
 export interface BrowserPort {
   navigate(url: string): Promise<{ requestedUrl: string; finalUrl: string; status: number | null; title: string }>;
-  extractVisible(): Promise<{ title: string; text: string; headings: string[]; links: LinkEvidence[]; controls: ControlEvidence[] }>;
+  extractVisible(): Promise<{ title: string; text: string; headings: string[]; links: LinkEvidence[]; controls: ControlEvidence[]; blocks?: TextBlock[]; canvases?: Array<{ locator: string; box: Box }>; viewport?: Viewport }>;
   screenshot(): Promise<Buffer>;
   close(): Promise<void>;
 }
 export interface ObservationReceipt {
   id: string; sourceKind: "browser"; requestedUrl: string; finalUrl: string; status: number | null;
   title: string; text: string; headings: string[]; links: LinkEvidence[]; controls: ControlEvidence[];
+  /** Paragraph-level text with positions on the screenshot (empty when the browser port can't measure them). */
+  blocks: TextBlock[]; canvases: Array<{ locator: string; box: Box }>; viewport: Viewport | null;
   observations: Observation[]; snapshotHash: string; screenshotUrl: string; engine: string;
   actionsPerformed: string[]; mutations: [];
 }
 
-const MAX_TEXT = 12_000, MAX_LINKS = 50, MAX_CONTROLS = 60, MAX_REDIRECTS = 8;
+const MAX_TEXT = 12_000, MAX_LINKS = 50, MAX_CONTROLS = 60, MAX_REDIRECTS = 8, MAX_BLOCKS = 200, MAX_BLOCK_CHARS = 2_000;
 export function parseTargetUrl(raw: string): URL {
   if (typeof raw !== "string" || raw.length > 2048) throw new Error("URL must be a string no longer than 2048 characters");
   let url: URL;
@@ -107,7 +111,8 @@ export class PlaywrightBrowserPort implements BrowserPort {
         .filter(item => item.label);
       return { title: document.title.slice(0, 300), text, headings, links, controls };
     }, { maxText: MAX_TEXT, maxLinks: MAX_LINKS, maxControls: MAX_CONTROLS });
-    return extracted;
+    const measured = await this.page.evaluate(extractVisibleBlocks, { maxBlocks: MAX_BLOCKS, maxChars: MAX_BLOCK_CHARS }) as ReturnType<typeof extractVisibleBlocks>;
+    return { ...extracted, blocks: measured.blocks, canvases: measured.canvases, viewport: measured.viewport };
   }
   async screenshot(): Promise<Buffer> { if (!this.page) throw new Error("Browser is closed"); return Buffer.from(await this.page.screenshot({ type: "png", fullPage: false, animations: "disabled" })); }
   async close() { await this.browser?.close(); this.browser = null; this.page = null; }
@@ -118,13 +123,15 @@ export async function observeHtml(browser: BrowserPort, rawUrl: string, saveScre
   try {
     const navigated = await browser.navigate(requested), page = await browser.extractVisible(), screenshot = await browser.screenshot(), id = randomUUID();
     const observations: Observation[] = [];
-    const add = (kind: Observation["kind"], value: string, locator: string) => observations.push({ evidenceId: `E${String(observations.length + 1).padStart(3, "0")}`, kind, value, locator });
+    const add = (kind: Observation["kind"], value: string, locator: string, at?: Pick<Observation, "box" | "inView" | "drawn">) => observations.push({ evidenceId: `E${String(observations.length + 1).padStart(3, "0")}`, kind, value, locator, ...at });
+    const blocks = page.blocks ?? [], canvases = page.canvases ?? [], viewport = page.viewport ?? null;
     add("title", page.title, "document.title"); page.headings.forEach((x, i) => add("heading", x, `heading[${i + 1}]`));
     if (page.text) add("text", page.text, "document.body.innerText");
     page.links.forEach(x => add("link", `${x.text} → ${x.href}`, x.locator)); page.controls.forEach(x => add("control", `${x.role}: ${x.label}${x.disabled ? " (disabled)" : ""}`, x.locator));
-    const snapshot = JSON.stringify({ title: page.title, text: page.text, headings: page.headings, links: page.links, controls: page.controls, observations });
+    blocks.forEach(x => add("block", x.text, x.locator, { box: x.box, inView: x.inView, drawn: x.drawn }));
+    const snapshot = JSON.stringify({ title: page.title, text: page.text, headings: page.headings, links: page.links, controls: page.controls, blocks, canvases, viewport, observations });
     const screenshotUrl = saveScreenshot ? await saveScreenshot(id, screenshot) : `data:image/png;base64,${screenshot.toString("base64")}`;
-    return { id, sourceKind: "browser", requestedUrl: navigated.requestedUrl, finalUrl: navigated.finalUrl, status: navigated.status, title: page.title, text: page.text, headings: page.headings, links: page.links, controls: page.controls, observations, snapshotHash: createHash("sha256").update(snapshot).digest("hex"), screenshotUrl, engine: "chromium", actionsPerformed: ["navigate", "extract_visible_dom", "screenshot"], mutations: [] };
+    return { id, sourceKind: "browser", requestedUrl: navigated.requestedUrl, finalUrl: navigated.finalUrl, status: navigated.status, title: page.title, text: page.text, headings: page.headings, links: page.links, controls: page.controls, blocks, canvases, viewport, observations, snapshotHash: createHash("sha256").update(snapshot).digest("hex"), screenshotUrl, engine: "chromium", actionsPerformed: ["navigate", "extract_visible_dom", "screenshot"], mutations: [] };
   } finally { await browser.close(); }
 }
 export async function observeUrl(rawUrl: string, saveScreenshot?: (id: string, png: Buffer) => Promise<string>) { return observeHtml(await PlaywrightBrowserPort.create(), rawUrl, saveScreenshot); }

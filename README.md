@@ -22,6 +22,48 @@ The server binds loopback by default. Do not put it on the public internet witho
 
 The adapter extracts visible body text, headings, links, and form/control labels (bounded sizes), with locators for source elements. The receipt records requested/final URLs, status, browser engine, actions, `mutations: []`, a stable receipt ID, SHA-256 snapshot hash, and screenshot hash. Text, headings, and link/control records are evidence. Interpretation, trust, or whether a control is safe to activate are intentionally not asserted.
 
+## Positions and paragraphs
+
+Browser captures also return `blocks`: the visible text of each block-level element (paragraph, list item, heading, table cell…), with inline children folded in. Each block has its box on the screenshot as fractions of the viewport (`[x, y, w, h]`), measured from the text's own line boxes at capture time, plus its locator. Receipts record the `viewport` so boxes map onto the screenshot exactly. Blocks become `block` observations, and they are part of the snapshot hash.
+
+- **Off-screen text.** Blocks scrolled out of view keep their position (outside 0–1) and are marked `inView: false`.
+- **Text that isn't drawn.** Text kept only for screen readers (the usual clip-to-nothing and 1px patterns) is still returned, as `drawn: false` with `box: null`, never with an invented position.
+- **Canvases.** Pages often paint text on a canvas and keep an accessible copy like that. Canvases are listed with their boxes, so a reader knows where painted content is without the lens claiming what it says.
+
+The extractor is `lib/extract-blocks.js`: self-contained, so it can run through Playwright or `chrome.scripting`, and it never changes the document.
+
+## Evidence packs and the shared check
+
+`lib/evidence.js` is the one place that decides whether something a lens saw may be shown or quoted. It has no dependencies and no Node APIs, so it runs in Node, in browser pages, and as `dist/evidence.iife.js` (`globalThis.WorldLensEvidence`, built by `node scripts/build-evidence-iife.mjs`) in pages that don't load modules.
+
+A pack (`world-lens.evidence-pack.v1`) holds:
+
+- **`source`.** Where the evidence came from, plus anything that happened to produce it, stated rather than implied.
+- **`screens`.** Images of what was seen, by hash.
+- **`items`.** Evidence `{ id, text, at: [{ screen, box, by }] }`. Positions say `by: "capture"` when measured at capture time, or `by: "editor"` when placed by hand afterwards.
+- **`derivatives`.** Copies of screens made for display, by hash.
+- **The World Lens boundary.** `pageContentIsUntrusted: true`, `actionAuthorized: false`, `mutations: []`, `interpretation: null`.
+
+The `snapshotHash` covers the schema, the source, every item's id, text and captured positions, and every screen's hash. Editor positions and derivatives are checked but not hashed in, so placing a zoom box or re-exporting a thumbnail doesn't change what was captured.
+
+- `verifyPack(pack, { read })` re-hashes the snapshot, every screen and every derivative, and checks the boundary, ids and placements. With `allowMissingScreens`, an original kept elsewhere is a warning, provided its displayed copy verifies.
+- `supports(pack, cite, quote)` is the shared rule: a quote may be shown only if the item it cites contains it, or if it is marked illustrative. Otherwise it returns a stable reason:
+  - `uncited and not marked illustrative`
+  - `no such evidence: <id>`
+  - `not in the evidence (<id>)`
+
+  Case, quote marks, apostrophes and whitespace don't count; words and punctuation do. `findSupport(pack, quote)` finds the item for text that's read aloud without naming its source.
+- `packFromReceipt(receipt)` turns a browser receipt into a pack. `GET /api/lens/receipts/<id>/pack` serves any stored capture that way.
+
+The CLIs are:
+
+```sh
+node bin/lens-seal.mjs unsealed.json -o pack.json          # hash and seal a pack written by any capture script
+node bin/lens-verify.mjs pack.json --dir <screens> --quotes quotes.json [--allow-missing-screens]
+```
+
+`lens-verify` exits 0 only if the pack verifies and every quote is supported. The Future Radio studio vendors these files, and its scenes refuse anything `supports()` refuses.
+
 ## Security boundary
 
 - HTTPS only; query strings, embedded credentials, literal IPs, local names, and private/reserved DNS answers are rejected.
@@ -60,7 +102,7 @@ Verification: `RETAINED_ARTIFACT_DIR=<absolute-output-directory> node --import t
 
 This repository contains the World Lens service, browser adapter, retained-session lifecycle, selected-tab extension, UI and reproducible tests/harnesses. Runtime captures, screenshots, disposable browser profiles, credentials and local logs are excluded. Future Radio integration code lives in a separate checkout and is not part of this push; references to its producer routes describe that companion integration, not bundled functionality.
 
-Current local checks: 23 tests pass; typecheck and JavaScript syntax checks pass. Controlled product-dispatcher and retained-session browser rehearsals have also passed. These results do not establish internet-facing security, personal-browser attachment, audio output or public broadcast. No deployment is included.
+Current local checks: 33 tests pass; typecheck and JavaScript syntax checks pass. Controlled product-dispatcher and retained-session browser rehearsals have also passed. These results do not establish internet-facing security, personal-browser attachment, audio output or public broadcast. No deployment is included.
 
 ## Deployment boundary
 
